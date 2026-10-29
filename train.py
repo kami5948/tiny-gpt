@@ -83,32 +83,6 @@ PROMPT_RESPONSES = [
     ("what is a checkpoint file", "a checkpoint file stores the trained model weights and settings"),
     ("what is deployment", "deployment is putting a trained model into use so others can interact with it"),
     ("what is coding", "coding is the act of writing logic and instructions so a program can do useful work"),
-    ("can you explain yourself", "i explain by predicting likely text continuations from patterns in training data"),
-    ("can you do math", "i can follow simple symbolic patterns, but i am not a formal calculator"),
-    ("what is language modeling", "language modeling means predicting the next token in a sequence of text"),
-    ("what is a vector", "a vector is a list of numbers representing information in a model"),
-    ("what is a neural network", "a neural network is a structure of connected layers that transforms data"),
-    ("what is a hidden layer", "a hidden layer sits between the input and output and captures internal patterns"),
-    ("what is backpropagation", "backpropagation is the process of calculating how errors should change the model weights"),
-    ("what is a tokenizer", "a tokenizer converts text into tokens that a model can process"),
-    ("why do models sometimes repeat", "models may repeat because they predict the most likely next token several times in a row"),
-    ("what is a demo model", "a demo model is a compact model meant to show a concept in a simple way"),
-    ("what is brainstorming", "brainstorming is generating many ideas before choosing the best one"),
-    ("what is a prototype", "a prototype is an early version of a system used to test a concept"),
-    ("what is an experiment", "an experiment is a structured test to learn more about how a model behaves"),
-    ("why test small models", "small models are easier to debug and give fast feedback during experimentation"),
-    ("what is a sequence", "a sequence is an ordered list of tokens such as a sentence or paragraph"),
-    ("what is randomness in generation", "randomness makes output varied instead of always choosing the same token"),
-    ("what is a context window", "a context window is the number of previous tokens the model can look at"),
-    ("what is coding ai", "coding ai is the use of language models to assist with programming and technical tasks"),
-    ("what is a tiny model", "a tiny model is a compact model designed to be fast, small, and trainable on modest hardware"),
-    ("what is text generation", "text generation is the process of creating new text from a prompt and learned patterns"),
-    ("what is the best way to learn", "the best way to learn is to build small projects, test ideas, and iterate quickly"),
-    ("what is a github repo", "a github repo is a project directory stored and versioned on github"),
-    ("what is a workflow", "a workflow is an automated process that runs code steps for you"),
-    ("what is automation", "automation is the process of letting software do repetitive tasks without manual steps"),
-    ("what is a model checkpoint", "a model checkpoint is a saved copy of the model at a given training stage"),
-    ("what is code", "code is a set of instructions written in a programming language"),
     ("what are examples", "examples are specific test cases used to teach a system what patterns to follow"),
 ]
 
@@ -138,5 +112,176 @@ GENERIC_TEXT = [
     "simple code and strong examples are often more valuable than complexity\n",
     "machine learning is basically pattern discovery through optimization\n",
     "models update their internal weights based on feedback from errors\n",
-    "many](#)
-
+]
+
+# ============================================================
+# Model implementation
+# ============================================================
+
+@dataclass
+class TrainingConfig:
+    vocab_size: int = VOCAB_SIZE
+    block_size: int = BLOCK_SIZE
+    n_layer: int = 4
+    n_head: int = 4
+    n_embd: int = 64
+    dropout: float = 0.1
+    learning_rate: float = 3e-3
+    batch_size: int = 16
+    max_iters: int = 3000
+    eval_interval: int = 200
+    generate_length: int = 80
+    seed: int = 1337
+
+
+class TinyGPT(nn.Module):
+    def __init__(self, config: TrainingConfig):
+        super().__init__()
+        self.config = config
+        self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
+        self.position_embedding = nn.Embedding(config.block_size, config.n_embd)
+        self.blocks = nn.ModuleList([
+            nn.ModuleDict({
+                "ln_1": nn.LayerNorm(config.n_embd),
+                "attn": nn.MultiheadAttention(config.n_embd, config.n_head, dropout=config.dropout, batch_first=True),
+                "ln_2": nn.LayerNorm(config.n_embd),
+                "mlp": nn.Sequential(
+                    nn.Linear(config.n_embd, 4 * config.n_embd),
+                    nn.GELU(),
+                    nn.Linear(4 * config.n_embd, config.n_embd),
+                    nn.Dropout(config.dropout),
+                ),
+            })
+            for _ in range(config.n_layer)
+        ])
+        self.ln_f = nn.LayerNorm(config.n_embd)
+        self.head = nn.Linear(config.n_embd, config.vocab_size)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        tok = self.token_embedding(idx)
+        pos = self.position_embedding(torch.arange(T, device=idx.device))
+        x = tok + pos.unsqueeze(0).expand(B, -1, -1)
+
+        for block in self.blocks:
+            residual = x
+            x = block["ln_1"](x)
+            attn_out, _ = block["attn"](x, x, x, need_weights=False)
+            x = residual + attn_out
+            residual = x
+            x = block["ln_2"](x)
+            x = residual + block["mlp"](x)
+
+        x = self.ln_f(x)
+        logits = self.head(x)
+
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits = logits.view(B * T, C)
+            targets = targets.view(B * T)
+            loss = F.cross_entropy(logits, targets)
+
+        return logits, loss
+
+
+class CharDataset(Dataset):
+    def __init__(self, texts, block_size):
+        self.texts = texts
+        self.block_size = block_size
+        self.tokens = []
+        for text in texts:
+            self.tokens.extend([stoi[ch] for ch in text])
+
+    def __len__(self):
+        return max(1, len(self.tokens) - self.block_size)
+
+    def __getitem__(self, idx):
+        chunk = self.tokens[idx:idx + self.block_size + 1]
+        x = torch.tensor(chunk[:-1], dtype=torch.long)
+        y = torch.tensor(chunk[1:], dtype=torch.long)
+        return x, y
+
+
+def build_dataset(texts):
+    dataset = CharDataset(texts, BLOCK_SIZE)
+    loader = DataLoader(dataset, batch_size=32, shuffle=True)
+    return loader
+
+
+def generate_text(model, prompt, max_new_tokens=80, temperature=0.9):
+    model.eval()
+    input_ids = [stoi[ch] for ch in prompt]
+    generated = input_ids[:]
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            x = torch.tensor([generated[-BLOCK_SIZE:]], dtype=torch.long)
+            logits, _ = model(x)
+            logits = logits[:, -1, :] / temperature
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1).item()
+            generated.append(next_token)
+            if len(generated) > BLOCK_SIZE + max_new_tokens:
+                break
+    return "".join(itos[i] for i in generated)
+
+
+def train_model(config: TrainingConfig, texts):
+    torch.manual_seed(config.seed)
+    random.seed(config.seed)
+
+    model = TinyGPT(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    loader = build_dataset(texts)
+
+    for step in range(config.max_iters):
+        model.train()
+        for xb, yb in loader:
+            optimizer.zero_grad()
+            logits, loss = model(xb, yb)
+            loss.backward()
+            optimizer.step()
+            break
+
+        if step % config.eval_interval == 0:
+            print(f"step {step}: loss {loss.item():.4f}")
+
+    return model
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Tiny GPT toy model")
+    parser.add_argument("--interactive", action="store_true")
+    parser.add_argument("--max_iters", type=int, default=3000)
+    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--temperature", type=float, default=0.9)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    config = TrainingConfig(seed=args.seed, max_iters=args.max_iters)
+    texts = list(PROMPT_RESPONSES)
+    texts.extend((prompt, text) for prompt, text in PROMPT_RESPONSES)
+    texts = [prompt + "\n" + response for prompt, response in PROMPT_RESPONSES]
+    texts += GENERIC_TEXT
+
+    model = train_model(config, texts)
+
+    if args.interactive:
+        print("Tiny GPT ready. Type 'exit' to quit.")
+        while True:
+            prompt = input("You: ")
+            if prompt.lower() in {"exit", "quit"}:
+                break
+            response = generate_text(model, prompt, max_new_tokens=80, temperature=args.temperature)
+            print(f"Model: {response}")
+    else:
+        prompt = "hello"
+        response = generate_text(model, prompt, max_new_tokens=80, temperature=args.temperature)
+        print(response)
+
+
+if __name__ == "__main__":
+    main()
